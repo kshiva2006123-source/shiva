@@ -106,12 +106,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const handleFile = (file) => {
         if (!file) return;
 
-        const validTypes = ['image/jpeg', 'image/png', 'application/pdf'];
-        if (!validTypes.includes(file.type)) {
-            alert('Please upload a valid JPG, PNG, or PDF file.');
-            return;
-        }
-
         currentFile = file;
         originalSize = file.size;
         const ext = getFileExt(file.name);
@@ -137,16 +131,16 @@ document.addEventListener('DOMContentLoaded', () => {
         // Setup Settings UI
         originalFilename.textContent = currentFile.name;
         originalFilesize.textContent = formatBytes(currentFile.size);
-        const ext = getFileExt(currentFile.name);
-        settingsFileBadge.textContent = ext;
-        settingsFileBadge.className = `file-badge ${ext.toLowerCase()}`;
+        const ext = getFileExt(currentFile.name).toLowerCase();
+        settingsFileBadge.textContent = ext.toUpperCase();
+        settingsFileBadge.className = `file-badge ${ext}`;
 
-        if (currentFile.type === 'application/pdf') {
-            dimensionsGroup.classList.add('hidden');
-            if (qualityGroup) qualityGroup.classList.add('hidden');
-        } else {
+        if (['jpg', 'jpeg', 'png'].includes(ext)) {
             dimensionsGroup.classList.remove('hidden');
             if (qualityGroup) qualityGroup.classList.remove('hidden');
+        } else {
+            dimensionsGroup.classList.add('hidden');
+            if (qualityGroup) qualityGroup.classList.add('hidden');
         }
 
         showSection(settingsSection, 1);
@@ -199,28 +193,23 @@ document.addEventListener('DOMContentLoaded', () => {
         if (targetHeightInput.value) formData.append('targetHeight', targetHeightInput.value);
 
         try {
-            const response = await fetch('/compress', {
+            fetch('/your-api-endpoint', {
                 method: 'POST',
                 body: formData
-            });
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Compression failed');
-            }
-
-            compressedFileBlob = await response.blob();
-
-            // Generate Preview URL
-            if (objectUrl) URL.revokeObjectURL(objectUrl);
-            objectUrl = URL.createObjectURL(compressedFileBlob);
-
-            showResults();
-        } catch (err) {
-            console.error(err);
-            alert('Error compressing file: ' + err.message);
-            showSection(settingsSection, 1);
-        }
+            })
+                .then(response => {
+                    // Check if the response was successful BEFORE parsing JSON
+                    if (!response.ok) {
+                        throw new Error(`Server error: ${response.status} ${response.statusText}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    // Handle success
+                })
+                .catch(error => {
+                    alert("Error compressing file: " + error.message);
+                }
     });
 
     // --- Results Handlers ---

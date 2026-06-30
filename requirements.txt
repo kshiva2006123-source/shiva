@@ -3,3 +3,4 @@ pillow
 pymupdf
 werkzeug
 gunicorn
+imageio-ffmpeg
