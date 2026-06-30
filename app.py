@@ -1,8 +1,5 @@
 import os
 import io
-import zipfile
-import subprocess
-import imageio_ffmpeg
 from flask import Flask, request, send_file, send_from_directory, jsonify
 from PIL import Image
 import fitz  # PyMuPDF
@@ -10,7 +7,6 @@ from werkzeug.utils import secure_filename
 import tempfile
 
 app = Flask(__name__, static_folder='.', static_url_path='')
-app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024 # 1GB Max Upload
 
 @app.route('/')
 def index():
@@ -81,125 +77,33 @@ def compress_image(file_obj, target_mb, max_width, max_height, explicit_quality=
     # If no target size, use the provided quality value
     return save_with_quality(img, explicit_quality), 'image/jpeg', 'compressed.jpg'
 
-def compress_pdf(file_obj, target_mb=None):
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
-        file_obj.save(temp_pdf)
-        temp_pdf_path = temp_pdf.name
-        
-    target_bytes = target_mb * 1024 * 1024 if target_mb else None
+def compress_pdf(file_obj):
+    pdf_bytes = file_obj.read()
+    doc = fitz.open("pdf", pdf_bytes)
     
-    def try_compress(quality, scale=1.0):
-        doc = fitz.open(temp_pdf_path)
-        for page in doc:
-            for img in page.get_images(full=True):
-                xref = img[0]
-                try:
-                    base_image = doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    pil_img = Image.open(io.BytesIO(image_bytes))
-                    if pil_img.mode in ('RGBA', 'P'):
-                        pil_img = pil_img.convert('RGB')
-                    
-                    if scale < 1.0:
-                        new_w = max(10, int(pil_img.width * scale))
-                        new_h = max(10, int(pil_img.height * scale))
-                        pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                        
-                    img_io = io.BytesIO()
-                    pil_img.save(img_io, format="JPEG", quality=quality, optimize=True)
-                    page.replace_image(xref, stream=img_io.getvalue())
-                except Exception:
-                    pass
-        output = io.BytesIO()
-        doc.save(output, garbage=4, deflate=True, clean=True)
-        doc.close()
-        output.seek(0)
-        return output
-
-    try:
-        if target_bytes:
-            # Binary search for quality
-            low = 5
-            high = 60
-            best_output = None
-            
-            while low <= high:
-                mid = (low + high) // 2
-                temp_output = try_compress(mid)
-                size = temp_output.getbuffer().nbytes
+    # Attempt to compress images within the PDF if it's large
+    for page in doc:
+        for img in page.get_images(full=True):
+            xref = img[0]
+            try:
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
                 
-                if size <= target_bytes:
-                    best_output = temp_output
-                    low = mid + 1
-                else:
-                    high = mid - 1
-                    
-            if best_output:
-                return best_output, 'application/pdf', 'compressed.pdf'
+                pil_img = Image.open(io.BytesIO(image_bytes))
+                if pil_img.mode in ('RGBA', 'P'):
+                    pil_img = pil_img.convert('RGB')
                 
-            # If even quality 5 is too big, scale down
-            scale = 0.8
-            while scale > 0.1:
-                temp_output = try_compress(10, scale)
-                if temp_output.getbuffer().nbytes <= target_bytes:
-                    return temp_output, 'application/pdf', 'compressed.pdf'
-                scale -= 0.2
-                
-            return try_compress(5, 0.1), 'application/pdf', 'compressed.pdf'
+                img_io = io.BytesIO()
+                pil_img.save(img_io, format="JPEG", quality=40, optimize=True)
+            except Exception:
+                pass
     
-        return try_compress(40), 'application/pdf', 'compressed.pdf'
-    finally:
-        if os.path.exists(temp_pdf_path):
-            os.remove(temp_pdf_path)
-
-def compress_media(file_obj, original_filename, target_mb):
-    ext = original_filename.rsplit('.', 1)[-1].lower()
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as temp_in:
-        file_obj.save(temp_in)
-        temp_in_path = temp_in.name
-        
-    out_ext = ext
-    temp_out_path = temp_in_path + f'_compressed.{out_ext}'
-    
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    
-    try:
-        cmd = [ffmpeg_exe, '-i', temp_in_path, '-y']
-        
-        if ext in ['mp4', 'mov', 'avi', 'mkv']:
-            if target_mb:
-                cmd.extend(['-vcodec', 'libx264', '-crf', '32', '-preset', 'faster', '-acodec', 'aac', '-b:a', '96k'])
-            else:
-                cmd.extend(['-vcodec', 'libx264', '-crf', '28', '-preset', 'fast', '-acodec', 'aac', '-b:a', '128k'])
-        elif ext in ['mp3', 'wav', 'ogg', 'm4a']:
-            cmd.extend(['-acodec', 'libmp3lame', '-b:a', '96k' if target_mb else '128k'])
-            temp_out_path = temp_in_path + '_compressed.mp3'
-            out_ext = 'mp3'
-            
-        cmd.append(temp_out_path)
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        with open(temp_out_path, 'rb') as f:
-            output_bytes = f.read()
-            
-        output = io.BytesIO(output_bytes)
-        output.seek(0)
-        mimetype = 'video/mp4' if out_ext in ['mp4', 'mov', 'avi', 'mkv'] else 'audio/mpeg'
-        return output, mimetype, f'compressed_{original_filename.rsplit(".", 1)[0]}.{out_ext}'
-    finally:
-        if os.path.exists(temp_in_path):
-            os.remove(temp_in_path)
-        if os.path.exists(temp_out_path):
-            os.remove(temp_out_path)
-
-def compress_zip(file_obj, original_filename):
     output = io.BytesIO()
-    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zipf:
-        zipf.writestr(original_filename, file_obj.read())
-        
+    doc.save(output, garbage=4, deflate=True, clean=True)
+    doc.close()
+    
     output.seek(0)
-    return output, 'application/zip', f'compressed_{original_filename}.zip'
+    return output, 'application/pdf', 'compressed.pdf'
 
 @app.route('/compress', methods=['POST'])
 def compress_file():
@@ -222,11 +126,9 @@ def compress_file():
         if ext in ['jpg', 'jpeg', 'png']:
             output, mimetype, out_filename = compress_image(file, target_mb, max_width, max_height, quality)
         elif ext == 'pdf':
-            output, mimetype, out_filename = compress_pdf(file, target_mb)
-        elif ext in ['mp4', 'mov', 'avi', 'mkv', 'mp3', 'wav', 'ogg', 'm4a']:
-            output, mimetype, out_filename = compress_media(file, filename, target_mb)
+            output, mimetype, out_filename = compress_pdf(file)
         else:
-            output, mimetype, out_filename = compress_zip(file, filename)
+            return jsonify({'error': 'Unsupported file format'}), 400
             
         return send_file(
             output,
