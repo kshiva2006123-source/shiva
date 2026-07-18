@@ -1,6 +1,5 @@
 import os
 import io
-import shutil
 from flask import Flask, request, send_file, send_from_directory, jsonify, after_this_request
 from PIL import Image
 import fitz  # PyMuPDF
@@ -32,8 +31,6 @@ def compress_image(input_path, target_mb, max_width, max_height, explicit_qualit
 
     if target_mb:
         target_bytes = target_mb * 1024 * 1024
-        
-        # 1. Pre-check: If already smaller than target, just return it.
         if original_size <= target_bytes and not (max_width or max_height):
             os.remove(output_path)
             return input_path, 'image/jpeg', 'compressed.jpg'
@@ -41,20 +38,18 @@ def compress_image(input_path, target_mb, max_width, max_height, explicit_qualit
         low, high = 5, 95
         best_path = None
         
-        # Binary search for image quality
         while low <= high:
             mid = (low + high) // 2
             img.save(output_path, format='JPEG', quality=mid, optimize=True)
             if os.path.getsize(output_path) <= target_bytes:
                 best_path = output_path
-                low = mid + 1 # Try to get better quality
+                low = mid + 1
             else:
-                high = mid - 1 # Reduce size
+                high = mid - 1
                 
         if best_path:
             return output_path, 'image/jpeg', 'compressed.jpg'
             
-        # Aggressive scaling down if still too big
         scale = 0.9
         while scale > 0.1:
             new_w, new_h = int(img.width * scale), int(img.height * scale)
@@ -67,7 +62,6 @@ def compress_image(input_path, target_mb, max_width, max_height, explicit_qualit
             
     img.save(output_path, format='JPEG', quality=explicit_quality, optimize=True)
     
-    # 2. Post-check Safety Net: Never return a file larger than the original
     if os.path.getsize(output_path) >= original_size:
         os.remove(output_path)
         return input_path, 'image/jpeg', 'compressed.jpg'
@@ -77,40 +71,40 @@ def compress_image(input_path, target_mb, max_width, max_height, explicit_qualit
 def compress_pdf(input_path, target_mb):
     original_size = os.path.getsize(input_path)
     
-    # 1. Pre-check
+    # Pre-check: No need to touch it if it's already under target
     if target_mb and original_size <= (target_mb * 1024 * 1024):
         return input_path, 'application/pdf', 'compressed.pdf'
         
     output_fd, output_path = tempfile.mkstemp(suffix=".pdf")
     os.close(output_fd)
     
-    quality_steps = [50, 35, 20, 10]
+    # Blazing-fast native PyMuPDF EZ compression options
+    # We step down aggressive levels until we clear the goal posts or hit the maximum reduction floor.
+    doc = fitz.open(input_path)
     
-    for quality in quality_steps:
-        doc = fitz.open(input_path)
-        for page in doc:
-            for img in page.get_images(full=True):
-                xref = img[0]
-                try:
-                    base_image = doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    pil_img = Image.open(io.BytesIO(image_bytes))
-                    if pil_img.mode in ('RGBA', 'P'):
-                        pil_img = pil_img.convert('RGB')
-                    
-                    img_io = io.BytesIO()
-                    pil_img.save(img_io, format="JPEG", quality=quality, optimize=True)
-                    doc.replace_image(xref, stream=img_io.getvalue())
-                except Exception:
-                    pass
-        
-        doc.save(output_path, garbage=4, deflate=True, clean=True)
+    # Step 1: Linearization and structural cleanup (Safe, quick drop)
+    doc.save(output_path, garbage=4, deflate=True, clean=True)
+    
+    # Step 2: If we have a strict target and standard compression didn't reach it, use EZ optimization
+    if target_mb and os.path.getsize(output_path) > (target_mb * 1024 * 1024):
         doc.close()
         
-        if not target_mb or (os.path.getsize(output_path) <= (target_mb * 1024 * 1024)):
-            break
-            
-    # 2. Post-check Safety Net
+        # re-open to clear save structures
+        doc = fitz.open(input_path)
+        
+        # Native PyMuPDF EZ compression levels
+        # 1 = Low compression, 2 = Medium, 3 = High, 4 = Extreme
+        for effort in [2, 3, 4]:
+            try:
+                doc.ez_save(output_path, garbage=4, deflate=True, clean=True, effort=effort)
+                if os.path.getsize(output_path) <= (target_mb * 1024 * 1024):
+                    break
+            except Exception:
+                pass
+                
+    doc.close()
+    
+    # Post-check Safety Net: If the compressed file ended up larger, fallback to original
     if os.path.getsize(output_path) >= original_size:
         os.remove(output_path)
         return input_path, 'application/pdf', 'compressed.pdf'
@@ -134,7 +128,6 @@ def compress_file():
     filename = secure_filename(file.filename)
     ext = filename.rsplit('.', 1)[-1].lower()
     
-    # Save to disk immediately to handle massive files safely
     input_fd, input_path = tempfile.mkstemp(suffix=f".{ext}")
     os.close(input_fd)
     file.save(input_path)
@@ -153,7 +146,6 @@ def compress_file():
         @after_this_request
         def cleanup(response):
             try:
-                # Be careful not to delete the file if input_path and output_path are the same (pre-check passed)
                 if os.path.exists(input_path) and input_path != output_path: 
                     os.remove(input_path)
                 if output_path and os.path.exists(output_path) and output_path != input_path: 
