@@ -1,5 +1,6 @@
 import os
 import io
+import shutil
 from flask import Flask, request, send_file, send_from_directory, jsonify, after_this_request
 from PIL import Image
 import fitz  # PyMuPDF
@@ -12,8 +13,9 @@ app = Flask(__name__, static_folder='.', static_url_path='')
 def index():
     return send_from_directory('.', 'index.html')
 
-def compress_image(file_path, target_mb, max_width, max_height, explicit_quality=80):
-    img = Image.open(file_path)
+def compress_image(input_path, target_mb, max_width, max_height, explicit_quality=80):
+    original_size = os.path.getsize(input_path)
+    img = Image.open(input_path)
     
     if max_width or max_height:
         original_width, original_height = img.size
@@ -30,6 +32,12 @@ def compress_image(file_path, target_mb, max_width, max_height, explicit_quality
 
     if target_mb:
         target_bytes = target_mb * 1024 * 1024
+        
+        # 1. Pre-check: If already smaller than target, just return it.
+        if original_size <= target_bytes and not (max_width or max_height):
+            os.remove(output_path)
+            return input_path, 'image/jpeg', 'compressed.jpg'
+
         low, high = 5, 95
         best_path = None
         
@@ -39,9 +47,9 @@ def compress_image(file_path, target_mb, max_width, max_height, explicit_quality
             img.save(output_path, format='JPEG', quality=mid, optimize=True)
             if os.path.getsize(output_path) <= target_bytes:
                 best_path = output_path
-                low = mid + 1
+                low = mid + 1 # Try to get better quality
             else:
-                high = mid - 1
+                high = mid - 1 # Reduce size
                 
         if best_path:
             return output_path, 'image/jpeg', 'compressed.jpg'
@@ -58,48 +66,55 @@ def compress_image(file_path, target_mb, max_width, max_height, explicit_quality
             scale -= 0.1
             
     img.save(output_path, format='JPEG', quality=explicit_quality, optimize=True)
+    
+    # 2. Post-check Safety Net: Never return a file larger than the original
+    if os.path.getsize(output_path) >= original_size:
+        os.remove(output_path)
+        return input_path, 'image/jpeg', 'compressed.jpg'
+        
     return output_path, 'image/jpeg', 'compressed.jpg'
 
-def compress_pdf(file_path, target_mb):
-    # Setup temporary file path for the output PDF
+def compress_pdf(input_path, target_mb):
+    original_size = os.path.getsize(input_path)
+    
+    # 1. Pre-check
+    if target_mb and original_size <= (target_mb * 1024 * 1024):
+        return input_path, 'application/pdf', 'compressed.pdf'
+        
     output_fd, output_path = tempfile.mkstemp(suffix=".pdf")
     os.close(output_fd)
     
-    # PDF sizes mostly come from embedded images. We will try compressing them at different qualities.
-    # We test qualities from 50 down to 10 to find a fit.
     quality_steps = [50, 35, 20, 10]
     
     for quality in quality_steps:
-        doc = fitz.open(file_path)
-        
-        # Loop through pages and re-compress images inside the PDF
+        doc = fitz.open(input_path)
         for page in doc:
             for img in page.get_images(full=True):
                 xref = img[0]
                 try:
                     base_image = doc.extract_image(xref)
                     image_bytes = base_image["image"]
-                    
                     pil_img = Image.open(io.BytesIO(image_bytes))
                     if pil_img.mode in ('RGBA', 'P'):
                         pil_img = pil_img.convert('RGB')
                     
                     img_io = io.BytesIO()
                     pil_img.save(img_io, format="JPEG", quality=quality, optimize=True)
-                    
-                    # Replace the old high-res image with our compressed version
                     doc.replace_image(xref, stream=img_io.getvalue())
                 except Exception:
                     pass
         
-        # Save to disk using maximum file size reduction settings
         doc.save(output_path, garbage=4, deflate=True, clean=True)
         doc.close()
         
-        # If no target target was provided, or if we succeeded in getting below it, stop.
         if not target_mb or (os.path.getsize(output_path) <= (target_mb * 1024 * 1024)):
             break
             
+    # 2. Post-check Safety Net
+    if os.path.getsize(output_path) >= original_size:
+        os.remove(output_path)
+        return input_path, 'application/pdf', 'compressed.pdf'
+        
     return output_path, 'application/pdf', 'compressed.pdf'
 
 @app.route('/compress', methods=['POST'])
@@ -119,7 +134,7 @@ def compress_file():
     filename = secure_filename(file.filename)
     ext = filename.rsplit('.', 1)[-1].lower()
     
-    # Create a safe file on disk to prevent RAM exhaustion
+    # Save to disk immediately to handle massive files safely
     input_fd, input_path = tempfile.mkstemp(suffix=f".{ext}")
     os.close(input_fd)
     file.save(input_path)
@@ -135,12 +150,14 @@ def compress_file():
             if os.path.exists(input_path): os.remove(input_path)
             return jsonify({'error': 'Unsupported file format'}), 400
             
-        # Register automatic cleanup after the request completes
         @after_this_request
         def cleanup(response):
             try:
-                if os.path.exists(input_path): os.remove(input_path)
-                if output_path and os.path.exists(output_path): os.remove(output_path)
+                # Be careful not to delete the file if input_path and output_path are the same (pre-check passed)
+                if os.path.exists(input_path) and input_path != output_path: 
+                    os.remove(input_path)
+                if output_path and os.path.exists(output_path) and output_path != input_path: 
+                    os.remove(output_path)
             except Exception as e:
                 print(f"Cleanup error: {e}")
             return response
@@ -158,4 +175,3 @@ def compress_file():
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
-
