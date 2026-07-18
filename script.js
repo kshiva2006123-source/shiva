@@ -204,12 +204,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: formData
             });
 
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Compression failed');
-            }
+          if (!response.ok) {
+    let errorMessage = 'Compression failed';
+    const contentType = response.headers.get("content-type");
+    if (contentType && contentType.includes("application/json")) {
+        const errorData = await response.json();
+        errorMessage = errorData.error || errorMessage;
+    } else {
+        errorMessage = `Server Error (${response.status}): The file might be too large for synchronous processing.`;
+    }
+    throw new Error(errorMessage);
+}
 
-            compressedFileBlob = await response.blob();
+   compressedFileBlob = await response.blob();
             
             // Generate Preview URL
             if (objectUrl) URL.revokeObjectURL(objectUrl);
